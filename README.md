@@ -58,21 +58,21 @@ Running an autonomous agent like `claude --dangerously-skip-permissions` over SS
 
 ## Presets
 
-| Preset       | Default launch command          |
-|--------------|----------------------------------|
-| `claude`     | `claude` *(see note below)*      |
-| `codex`      | `codex`                          |
-| `aider`      | `aider --yes-always`             |
-| `gemini`     | `gemini`                         |
-| `opencode`   | `opencode`                       |
-| `goose`      | `goose session`                  |
-| `cursor-agent` | `cursor-agent`                 |
-| `shell`      | *(none — plain shell on login)*  |
-| `custom`     | *(prompt for a custom command)*  |
+| Preset       | Default launch command          | Optional opt-in flag           |
+|--------------|----------------------------------|---------------------------------|
+| `claude`     | `claude`                         | `--dangerously-skip-permissions`|
+| `aider`      | `aider`                          | `--yes-always`                  |
+| `codex`      | `codex`                          | —                               |
+| `gemini`     | `gemini`                         | —                               |
+| `opencode`   | `opencode`                       | —                               |
+| `goose`      | `goose session`                  | —                               |
+| `cursor-agent` | `cursor-agent`                 | —                               |
+| `shell`      | *(none — plain shell on login)*  | —                               |
+| `custom`     | *(prompt for a custom command)*  | —                               |
 
-Override flags with `--launch-cmd 'codex --my-flag'`.
+Override or add flags with `--launch-cmd 'codex --my-flag'`.
 
-> **Note on Claude's `--dangerously-skip-permissions`**: The `claude` preset launches plain `claude` by default. In interactive mode the script asks if you want to append `--dangerously-skip-permissions` and explains the implication (auto-approves every tool use with no prompts — effectively unattended root-capable execution on a sudoer user). To opt in non-interactively, pass `--launch-cmd 'claude --dangerously-skip-permissions'`.
+> **Note on "skip all prompts" flags**: For presets where one exists (`claude`, `aider`), the script defaults to the *safe* command. In interactive mode it asks whether to append the opt-in flag and explains what it does (auto-approves every tool use / confirmation — effectively unattended root-capable execution on a sudoer user). To opt in non-interactively, pass it via `--launch-cmd`, e.g. `--launch-cmd 'claude --dangerously-skip-permissions'`.
 
 ## Examples
 

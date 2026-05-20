@@ -29,12 +29,23 @@ SCRIPT_NAME="ssh-launcher-user"
 declare -A PRESETS=(
     [claude]="claude"
     [codex]="codex"
-    [aider]="aider --yes-always"
+    [aider]="aider"
     [gemini]="gemini"
     [opencode]="opencode"
     [goose]="goose session"
     [cursor-agent]="cursor-agent"
     [shell]=""
+)
+
+# Opt-in "skip all prompts" flags per preset. Interactive flow asks before
+# appending; non-interactive runs leave these off (use --launch-cmd to opt in).
+declare -A DANGER_FLAGS=(
+    [claude]="--dangerously-skip-permissions"
+    [aider]="--yes-always"
+)
+declare -A DANGER_DESCRIPTIONS=(
+    [claude]="auto-approves every tool use (file edits, shell commands, network calls) with no prompts"
+    [aider]="auto-accepts every confirmation prompt (file edits, commits, model switches) without asking"
 )
 
 DEFAULT_PRESET=claude
@@ -223,14 +234,18 @@ cmd_create() {
             LAUNCH_CMD="${PRESETS[$PRESET]}"
         fi
 
-        # Tool-specific opt-in for dangerous flags
-        if [[ "$PRESET" == "claude" && "$LAUNCH_CMD" != *"--dangerously-skip-permissions"* ]]; then
-            say
-            warn "--dangerously-skip-permissions auto-approves every tool use (file edits, shell"
-            warn "commands, network calls) with no prompting. On a sudoer SSH user, that"
-            warn "effectively grants whoever connects unattended root-capable execution."
-            if prompt_yn "Append --dangerously-skip-permissions to the claude launch command?" "n"; then
-                LAUNCH_CMD="$LAUNCH_CMD --dangerously-skip-permissions"
+        # Tool-specific opt-in for "skip all prompts" flags
+        if [[ -v "DANGER_FLAGS[$PRESET]" ]]; then
+            local flag="${DANGER_FLAGS[$PRESET]}"
+            local desc="${DANGER_DESCRIPTIONS[$PRESET]}"
+            if [[ "$LAUNCH_CMD" != *"$flag"* ]]; then
+                say
+                warn "$flag $desc."
+                warn "On a sudoer SSH user, that effectively grants whoever connects"
+                warn "unattended root-capable execution."
+                if prompt_yn "Append $flag to the $PRESET launch command?" "n"; then
+                    LAUNCH_CMD="$LAUNCH_CMD $flag"
+                fi
             fi
         fi
 
