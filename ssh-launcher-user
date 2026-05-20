@@ -409,6 +409,19 @@ if [[ -n "\$INSTALL_BINARY" ]]; then
         install -m 755 "\$INSTALL_BINARY" "\$DEST"
         echo "[+] Installed \$INSTALL_BINARY → \$DEST"
     fi
+
+    # Per-user symlink in ~newuser/.local/bin/ — required by tools that
+    # check their canonical install path (e.g., claude with installMethod=
+    # native expects ~/.local/bin/claude). ~/.local/bin is in the default
+    # user PATH on Ubuntu/Debian, so the symlink also takes precedence.
+    USER_BIN_DIR="\$USER_HOME/.local/bin"
+    USER_LINK="\$USER_BIN_DIR/\$BIN_BASE"
+    if [[ ! -e "\$USER_LINK" ]]; then
+        install -d -m 755 -o "\$USERNAME" -g "\$USERNAME" "\$USER_BIN_DIR"
+        ln -s "\$DEST" "\$USER_LINK"
+        chown -h "\$USERNAME:\$USERNAME" "\$USER_LINK"
+        echo "[+] Symlinked \$USER_LINK → \$DEST"
+    fi
 fi
 
 if [[ "\$ENABLE_PASSWORD_AUTH" == "1" ]]; then
