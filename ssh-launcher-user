@@ -257,18 +257,6 @@ cmd_create() {
             [[ -z "$DEST_NAME" ]] && DEST_NAME="$(prompt 'Destination dir name under ~'"$USERNAME"'/' "$(basename "$SOURCE_DIR")")"
         fi
 
-        say
-        if [[ -n "$LAUNCH_CMD" ]]; then
-            local binary="${LAUNCH_CMD%% *}"
-            if ! command -v "$binary" >/dev/null && [[ "${binary:0:1}" != "/" ]]; then
-                warn "'$binary' not found in PATH. The new user won't be able to run it."
-                if prompt_yn "Install a binary system-wide to /usr/local/bin/$binary?" "n"; then
-                    INSTALL_BINARY="$(prompt 'Path to the binary to install')"
-                    INSTALL_BINARY="${INSTALL_BINARY/#\~/$HOME}"
-                    [[ -x "$INSTALL_BINARY" ]] || die "Not executable: $INSTALL_BINARY"
-                fi
-            fi
-        fi
     fi
 
     [[ -n "$USERNAME" ]] || die "Username is required (--username)."
@@ -291,6 +279,45 @@ cmd_create() {
     fi
 
     id "$SOURCE_USER" >/dev/null 2>&1 || die "Source user does not exist: $SOURCE_USER"
+
+    # Verify the launch command's binary is accessible to the NEW user — not just
+    # the current one. `command -v claude` finds claude in ~tyler/.local/bin/,
+    # but ~tyler is 0700 so the new user can't read it. Detect that and offer
+    # to install the binary system-wide.
+    if [[ -n "$LAUNCH_CMD" && -z "$INSTALL_BINARY" ]]; then
+        local binary="${LAUNCH_CMD%% *}"
+        local binary_path=""
+        if [[ "${binary:0:1}" == "/" ]]; then
+            binary_path="$binary"
+        else
+            binary_path="$(command -v "$binary" 2>/dev/null || true)"
+        fi
+
+        local resolved="" src_home="" issue=""
+        if [[ -z "$binary_path" ]]; then
+            issue="not found in PATH"
+        else
+            resolved="$(readlink -f "$binary_path" 2>/dev/null || echo "$binary_path")"
+            src_home="$(getent passwd "$SOURCE_USER" | cut -d: -f6)"
+            if [[ -n "$src_home" && "$resolved" == "$src_home"/* ]]; then
+                issue="resolves to $resolved (inside $SOURCE_USER's home — new user can't read it)"
+            fi
+        fi
+
+        if [[ -n "$issue" ]]; then
+            say
+            warn "'$binary' $issue."
+            if (( INTERACTIVE )); then
+                if prompt_yn "Install the binary system-wide to /usr/local/bin/$binary?" "y"; then
+                    INSTALL_BINARY="$(prompt 'Path to the binary to install' "$resolved")"
+                    INSTALL_BINARY="${INSTALL_BINARY/#\~/$HOME}"
+                    [[ -x "$INSTALL_BINARY" ]] || die "Not executable: $INSTALL_BINARY"
+                fi
+            else
+                warn "Pass --install-binary ${resolved:-PATH} to install it system-wide."
+            fi
+        fi
+    fi
 
     say
     say "===================="
