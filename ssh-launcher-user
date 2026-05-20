@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+# ssh-launcher-user
+#
+# Create a dedicated Linux user that auto-launches a chosen command on
+# interactive SSH login. Useful for sandboxing AI coding agents
+# (claude, codex, aider, gemini, opencode, goose, cursor-agent, ...) on
+# a host while keeping their state, sudo scope, and code tree isolated
+# from your primary user.
+#
+# Interactive by default; accepts flags for non-interactive use.
+#
+# Run as a regular sudoer user — the script will `sudo` internally where
+# needed. Refuses to run as root so $SUDO_USER context stays clean.
+#
+# See README.md for the full design rationale (recursive-exec trap,
+# why we don't put `exec` in .bashrc, etc.).
+
+set -euo pipefail
+
+VERSION="0.1.0"
+SCRIPT_NAME="ssh-launcher-user"
+
+# ---------- presets ----------
+# preset:default_launch_command
+declare -A PRESETS=(
+    [claude]="claude --dangerously-skip-permissions"
+    [codex]="codex"
+    [aider]="aider --yes-always"
+    [gemini]="gemini"
+    [opencode]="opencode"
+    [goose]="goose session"
+    [cursor-agent]="cursor-agent"
+    [shell]=""
+)
+
+DEFAULT_PRESET=claude
+
+# ---------- defaults ----------
+USERNAME=""
+PRESET=""
+LAUNCH_CMD=""
+SOURCE_DIR=""
+DEST_NAME=""
+SOURCE_USER="${SUDO_USER:-$USER}"
+ADD_SUDO=1
+COPY_SSH_KEYS=1
+COPY_GITCONFIG=1
+ENABLE_PASSWORD_AUTH=1
+SET_PASSWORD=1
+INSTALL_BINARY=""
+ASSUME_YES=0
+DRY_RUN=0
+
+# ---------- helpers ----------
+say()    { printf '%s\n' "$*"; }
+info()   { printf '\e[36m[*]\e[0m %s\n' "$*"; }
+ok()     { printf '\e[32m[+]\e[0m %s\n' "$*"; }
+warn()   { printf '\e[33m[!]\e[0m %s\n' "$*" >&2; }
+err()    { printf '\e[31m[x]\e[0m %s\n' "$*" >&2; }
+die()    { err "$*"; exit 1; }
+
+run() {
+    if (( DRY_RUN )); then
+        printf '\e[2m  $ %s\e[0m\n' "$*"
+    else
+        eval "$@"
+    fi
+}
+
+prompt() {
+    local question="$1" default="${2:-}" answer
+    if [[ -n "$default" ]]; then
+        read -r -p "$question [$default]: " answer
+        printf '%s' "${answer:-$default}"
+    else
+        read -r -p "$question: " answer
+        printf '%s' "$answer"
+    fi
+}
+
+prompt_yn() {
+    local question="$1" default="${2:-y}" answer prompt_suffix
+    if [[ "$default" == "y" ]]; then prompt_suffix="[Y/n]"; else prompt_suffix="[y/N]"; fi
+    while true; do
+        read -r -p "$question $prompt_suffix: " answer
+        answer="${answer:-$default}"
+        case "$answer" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo])     return 1 ;;
+            *) warn "Please answer yes or no." ;;
+        esac
+    done
+}
+
+usage() {
+    cat <<EOF
+$SCRIPT_NAME v$VERSION — create a dedicated SSH user that auto-launches a command on login.
+
+USAGE
+    $SCRIPT_NAME [OPTIONS]
+
+OPTIONS
+    --username NAME              New user's name (required for non-interactive)
+    --preset NAME                One of: ${!PRESETS[@]} (default: $DEFAULT_PRESET)
+    --launch-cmd 'CMD'           Custom launch command (overrides --preset)
+    --source-dir PATH            Existing dir to move into new user's home
+    --dest-name NAME             Rename moved dir (default: basename of source)
+    --source-user USER           User to copy SSH keys / gitconfig from (default: \$SUDO_USER or \$USER)
+    --install-binary PATH        Copy this binary to /usr/local/bin/<name> so the new user can run it
+    --[no-]sudo                  Add new user to sudo group (default: yes)
+    --[no-]copy-ssh-keys         Copy --source-user's authorized_keys (default: yes)
+    --[no-]copy-gitconfig        Copy --source-user's .gitconfig (default: yes)
+    --[no-]enable-password-auth  Enable PasswordAuthentication in sshd if disabled (default: yes)
+    --[no-]set-password          Run passwd interactively after setup (default: yes)
+    --yes, -y                    Skip confirmation prompts (non-interactive)
+    --dry-run                    Print actions instead of executing
+    --help, -h                   Show this help
+    --version                    Show version
+
+PRESETS
+$(for k in "${!PRESETS[@]}"; do printf '    %-14s %s\n' "$k" "${PRESETS[$k]:-(plain shell)}"; done)
+
+EXAMPLES
+    # Fully interactive
+    $SCRIPT_NAME
+
+    # Non-interactive — set up a 'codebot' user that auto-runs claude in ~/proj
+    $SCRIPT_NAME --username codebot --preset claude \\
+        --source-dir ~/code/proj --yes
+
+    # Use a custom command (e.g., open a tmux session)
+    $SCRIPT_NAME --username opsbot --launch-cmd 'tmux attach -t ops || tmux new -s ops'
+EOF
+}
+
+# ---------- arg parsing ----------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --username)              USERNAME="$2"; shift 2 ;;
+        --preset)                PRESET="$2"; shift 2 ;;
+        --launch-cmd)            LAUNCH_CMD="$2"; shift 2 ;;
+        --source-dir)            SOURCE_DIR="$2"; shift 2 ;;
+        --dest-name)             DEST_NAME="$2"; shift 2 ;;
+        --source-user)           SOURCE_USER="$2"; shift 2 ;;
+        --install-binary)        INSTALL_BINARY="$2"; shift 2 ;;
+        --sudo)                  ADD_SUDO=1; shift ;;
+        --no-sudo)               ADD_SUDO=0; shift ;;
+        --copy-ssh-keys)         COPY_SSH_KEYS=1; shift ;;
+        --no-copy-ssh-keys)      COPY_SSH_KEYS=0; shift ;;
+        --copy-gitconfig)        COPY_GITCONFIG=1; shift ;;
+        --no-copy-gitconfig)     COPY_GITCONFIG=0; shift ;;
+        --enable-password-auth)    ENABLE_PASSWORD_AUTH=1; shift ;;
+        --no-enable-password-auth) ENABLE_PASSWORD_AUTH=0; shift ;;
+        --set-password)          SET_PASSWORD=1; shift ;;
+        --no-set-password)       SET_PASSWORD=0; shift ;;
+        -y|--yes)                ASSUME_YES=1; shift ;;
+        --dry-run)               DRY_RUN=1; shift ;;
+        -h|--help)               usage; exit 0 ;;
+        --version)               echo "$SCRIPT_NAME $VERSION"; exit 0 ;;
+        *) die "Unknown option: $1. Try --help." ;;
+    esac
+done
+
+# ---------- preflight ----------
+if [[ $EUID -eq 0 ]]; then
+    die "Run this as a regular sudoer user — it will sudo internally. Refusing to run as root."
+fi
+
+command -v sudo >/dev/null || die "sudo is required."
+
+# ---------- interactive prompts (fill anything missing) ----------
+INTERACTIVE=1
+if [[ -n "$USERNAME" && $ASSUME_YES -eq 1 ]]; then INTERACTIVE=0; fi
+
+if [[ $INTERACTIVE -eq 1 ]]; then
+    say
+    say "==================================================="
+    say "  $SCRIPT_NAME v$VERSION"
+    say "  Set up a dedicated SSH user that auto-launches"
+    say "  a chosen command on interactive login."
+    say "==================================================="
+    say
+
+    [[ -z "$USERNAME" ]] && USERNAME="$(prompt 'New username')"
+    [[ -z "$USERNAME" ]] && die "Username is required."
+
+    # Preset selection
+    if [[ -z "$PRESET" && -z "$LAUNCH_CMD" ]]; then
+        say
+        say "Auto-launch preset:"
+        local_i=1
+        preset_keys=()
+        for k in "${!PRESETS[@]}"; do
+            printf '  %d) %-14s %s\n' "$local_i" "$k" "${PRESETS[$k]:-(plain shell — no auto-launch)}"
+            preset_keys+=("$k")
+            ((local_i++))
+        done
+        printf '  %d) %-14s %s\n' "$local_i" "custom" "(enter your own command)"
+        say
+        choice="$(prompt 'Choose' "$DEFAULT_PRESET")"
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            if (( choice >= 1 && choice <= ${#preset_keys[@]} )); then
+                PRESET="${preset_keys[$((choice-1))]}"
+            elif (( choice == local_i )); then
+                PRESET="custom"
+            else
+                die "Invalid choice: $choice"
+            fi
+        else
+            PRESET="$choice"
+        fi
+    fi
+
+    if [[ "$PRESET" == "custom" ]]; then
+        LAUNCH_CMD="$(prompt 'Custom launch command (leave empty for plain shell)')"
+    elif [[ -n "$PRESET" ]]; then
+        [[ -v "PRESETS[$PRESET]" ]] || die "Unknown preset: $PRESET"
+        LAUNCH_CMD="${PRESETS[$PRESET]}"
+    fi
+
+    say
+    if prompt_yn "Move an existing directory into ~$USERNAME/?" "n"; then
+        [[ -z "$SOURCE_DIR" ]] && SOURCE_DIR="$(prompt 'Source directory path')"
+        SOURCE_DIR="${SOURCE_DIR/#\~/$HOME}"
+        [[ -d "$SOURCE_DIR" ]] || die "Not a directory: $SOURCE_DIR"
+        [[ -z "$DEST_NAME" ]] && DEST_NAME="$(prompt 'Destination dir name under ~'"$USERNAME"'/' "$(basename "$SOURCE_DIR")")"
+    fi
+
+    say
+    if [[ -n "$LAUNCH_CMD" ]]; then
+        binary="${LAUNCH_CMD%% *}"
+        if ! command -v "$binary" >/dev/null && [[ "${binary:0:1}" != "/" ]]; then
+            warn "'$binary' not found in PATH. The new user won't be able to run it."
+            if prompt_yn "Install a binary system-wide to /usr/local/bin/$binary?" "n"; then
+                INSTALL_BINARY="$(prompt 'Path to the binary to install')"
+                INSTALL_BINARY="${INSTALL_BINARY/#\~/$HOME}"
+                [[ -x "$INSTALL_BINARY" ]] || die "Not executable: $INSTALL_BINARY"
+            fi
+        fi
+    fi
+fi
+
+# ---------- validation ----------
+[[ -n "$USERNAME" ]] || die "Username is required (--username)."
+[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid username: '$USERNAME'"
+
+if [[ -n "$PRESET" && "$PRESET" != "custom" ]]; then
+    [[ -v "PRESETS[$PRESET]" ]] || die "Unknown preset: $PRESET. Options: ${!PRESETS[*]}"
+    [[ -z "$LAUNCH_CMD" ]] && LAUNCH_CMD="${PRESETS[$PRESET]}"
+fi
+
+if [[ -n "$SOURCE_DIR" ]]; then
+    SOURCE_DIR="${SOURCE_DIR/#\~/$HOME}"
+    [[ -d "$SOURCE_DIR" ]] || die "Not a directory: $SOURCE_DIR"
+    [[ -z "$DEST_NAME" ]] && DEST_NAME="$(basename "$SOURCE_DIR")"
+fi
+
+if [[ -n "$INSTALL_BINARY" ]]; then
+    INSTALL_BINARY="${INSTALL_BINARY/#\~/$HOME}"
+    [[ -x "$INSTALL_BINARY" ]] || die "Not executable: $INSTALL_BINARY"
+fi
+
+id "$SOURCE_USER" >/dev/null 2>&1 || die "Source user does not exist: $SOURCE_USER"
+
+# ---------- plan summary ----------
+say
+say "===================="
+say "  Plan"
+say "===================="
+printf '  %-22s %s\n' "Username:"          "$USERNAME"
+printf '  %-22s %s\n' "Source user:"       "$SOURCE_USER"
+printf '  %-22s %s\n' "Add to sudo:"       "$(((ADD_SUDO))         && echo yes || echo no)"
+printf '  %-22s %s\n' "Copy SSH keys:"     "$(((COPY_SSH_KEYS))    && echo yes || echo no)"
+printf '  %-22s %s\n' "Copy .gitconfig:"   "$(((COPY_GITCONFIG))   && echo yes || echo no)"
+printf '  %-22s %s\n' "Enable pwd auth:"   "$(((ENABLE_PASSWORD_AUTH)) && echo yes || echo no)"
+printf '  %-22s %s\n' "Set password now:"  "$(((SET_PASSWORD))     && echo yes || echo no)"
+[[ -n "$INSTALL_BINARY" ]] && printf '  %-22s %s\n' "Install binary:" "$INSTALL_BINARY → /usr/local/bin/$(basename "$INSTALL_BINARY")"
+[[ -n "$SOURCE_DIR" ]]     && printf '  %-22s %s\n' "Move directory:" "$SOURCE_DIR → /home/$USERNAME/$DEST_NAME"
+if [[ -n "$LAUNCH_CMD" ]]; then
+    printf '  %-22s %s\n' "Auto-launch:"   "$LAUNCH_CMD"
+else
+    printf '  %-22s %s\n' "Auto-launch:"   "(none — plain shell on login)"
+fi
+(( DRY_RUN )) && printf '  %-22s %s\n' "Mode:" "DRY RUN (no changes will be made)"
+say
+
+if (( ! ASSUME_YES )); then
+    prompt_yn "Proceed?" "y" || die "Aborted."
+fi
+
+# ---------- execute ----------
+say
+info "Starting setup…"
+
+# Build the sudo script as a variable so we can inject our chosen options safely.
+TMP_SCRIPT="$(mktemp)"
+trap 'rm -f "$TMP_SCRIPT"' EXIT
+
+cat > "$TMP_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+USERNAME='$USERNAME'
+SOURCE_USER='$SOURCE_USER'
+ADD_SUDO='$ADD_SUDO'
+COPY_SSH_KEYS='$COPY_SSH_KEYS'
+COPY_GITCONFIG='$COPY_GITCONFIG'
+ENABLE_PASSWORD_AUTH='$ENABLE_PASSWORD_AUTH'
+INSTALL_BINARY='$INSTALL_BINARY'
+SOURCE_DIR='$SOURCE_DIR'
+DEST_NAME='$DEST_NAME'
+LAUNCH_CMD='${LAUNCH_CMD//\'/\'\\\'\'}'
+
+# 1. Create user (idempotent)
+if id "\$USERNAME" &>/dev/null; then
+    echo "[~] User '\$USERNAME' already exists"
+else
+    if [[ "\$ADD_SUDO" == "1" ]]; then
+        useradd -m -s /bin/bash -G sudo "\$USERNAME"
+        echo "[+] Created user '\$USERNAME' (sudo group)"
+    else
+        useradd -m -s /bin/bash "\$USERNAME"
+        echo "[+] Created user '\$USERNAME' (no sudo)"
+    fi
+fi
+
+USER_HOME="/home/\$USERNAME"
+
+# 2. SSH keys
+if [[ "\$COPY_SSH_KEYS" == "1" ]]; then
+    SRC_HOME="\$(getent passwd "\$SOURCE_USER" | cut -d: -f6)"
+    SRC_KEYS="\$SRC_HOME/.ssh/authorized_keys"
+    if [[ -f "\$SRC_KEYS" ]]; then
+        install -d -m 700 -o "\$USERNAME" -g "\$USERNAME" "\$USER_HOME/.ssh"
+        install -m 600 -o "\$USERNAME" -g "\$USERNAME" "\$SRC_KEYS" "\$USER_HOME/.ssh/authorized_keys"
+        echo "[+] SSH authorized_keys mirrored from \$SOURCE_USER"
+    else
+        echo "[~] \$SOURCE_USER has no authorized_keys, skipping"
+    fi
+fi
+
+# 3. gitconfig
+if [[ "\$COPY_GITCONFIG" == "1" ]]; then
+    SRC_HOME="\$(getent passwd "\$SOURCE_USER" | cut -d: -f6)"
+    if [[ -f "\$SRC_HOME/.gitconfig" ]]; then
+        install -m 644 -o "\$USERNAME" -g "\$USERNAME" "\$SRC_HOME/.gitconfig" "\$USER_HOME/.gitconfig"
+        echo "[+] Copied .gitconfig from \$SOURCE_USER"
+    fi
+fi
+
+# 4. System-install binary if requested
+if [[ -n "\$INSTALL_BINARY" ]]; then
+    BIN_BASE="\$(basename "\$INSTALL_BINARY")"
+    DEST="/usr/local/bin/\$BIN_BASE"
+    if [[ -x "\$DEST" ]]; then
+        echo "[~] \$DEST already exists, leaving as-is"
+    else
+        install -m 755 "\$INSTALL_BINARY" "\$DEST"
+        echo "[+] Installed \$INSTALL_BINARY → \$DEST"
+    fi
+fi
+
+# 5. Enable SSH password auth if cloud-init disabled it
+if [[ "\$ENABLE_PASSWORD_AUTH" == "1" ]]; then
+    NEED_RELOAD=0
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [[ -f "\$f" ]] || continue
+        if grep -qE '^PasswordAuthentication[[:space:]]+no' "\$f"; then
+            sed -i 's/^PasswordAuthentication[[:space:]]\+no/PasswordAuthentication yes/' "\$f"
+            NEED_RELOAD=1
+            echo "[+] Enabled PasswordAuthentication in \$f"
+        fi
+    done
+    if (( NEED_RELOAD )); then
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || echo "[!] could not reload ssh"
+    fi
+fi
+
+# 6. Move source dir
+if [[ -n "\$SOURCE_DIR" ]]; then
+    DST="\$USER_HOME/\$DEST_NAME"
+    if [[ -d "\$SOURCE_DIR" && ! -e "\$DST" ]]; then
+        mv "\$SOURCE_DIR" "\$DST"
+        chown -R "\$USERNAME:\$USERNAME" "\$DST"
+        echo "[+] Moved \$SOURCE_DIR → \$DST"
+    elif [[ -e "\$DST" ]]; then
+        echo "[~] \$DST already exists, skipping move"
+    fi
+fi
+
+# 7. .bash_profile (auto-launch + AUTO_LAUNCHED env guard against subshell recursion)
+PROFILE="\$USER_HOME/.bash_profile"
+LAUNCH_DIR="\$USER_HOME"
+if [[ -n "\$DEST_NAME" && -d "\$USER_HOME/\$DEST_NAME" ]]; then
+    LAUNCH_DIR="\$USER_HOME/\$DEST_NAME"
+fi
+
+if [[ -n "\$LAUNCH_CMD" ]]; then
+    cat > "\$PROFILE" <<PROFILE_EOF
+[[ -f ~/.bashrc ]] && source ~/.bashrc
+
+# Auto-launch on interactive SSH login.
+#   SSH_TTY        — interactive SSH only (sftp/scp/exec untouched).
+#   AUTO_LAUNCHED  — one-shot env guard. Exported on first launch and
+#                    inherited by subshells the launched program spawns
+#                    (e.g., AI agents that source the user profile for
+#                    each Bash tool call). Prevents infinite recursion.
+if [[ -n "\\\${SSH_TTY:-}" && -z "\\\${AUTO_LAUNCHED:-}" ]]; then
+    export AUTO_LAUNCHED=1
+    cd "\$LAUNCH_DIR" 2>/dev/null || cd ~
+    exec \$LAUNCH_CMD
+fi
+PROFILE_EOF
+    chown "\$USERNAME:\$USERNAME" "\$PROFILE"
+    chmod 644 "\$PROFILE"
+    echo "[+] Wrote \$PROFILE (auto-launch: \$LAUNCH_CMD)"
+else
+    echo "[~] No launch command; leaving default .bash_profile"
+fi
+EOF
+
+chmod +x "$TMP_SCRIPT"
+
+if (( DRY_RUN )); then
+    info "Dry run — would execute the following as root:"
+    say
+    cat "$TMP_SCRIPT" | sed 's/^/    /'
+    exit 0
+fi
+
+sudo bash "$TMP_SCRIPT"
+
+# Set password (interactive — outside the sudo heredoc)
+if (( SET_PASSWORD )); then
+    say
+    info "Set the password for $USERNAME:"
+    sudo passwd "$USERNAME"
+fi
+
+# ---------- done ----------
+say
+ok "All done."
+say
+say "Verify in a separate terminal:"
+say "    ssh $USERNAME@<host>"
+if [[ -n "$LAUNCH_CMD" ]]; then
+    say "    # Lands in $([ -n "$DEST_NAME" ] && echo "~/$DEST_NAME" || echo '~')"
+    say "    # and auto-launches: $LAUNCH_CMD"
+fi
+say
+say "Rollback (removes user + home, restores moved dir):"
+ROLLBACK_ARGS="--username $USERNAME"
+[[ -n "$SOURCE_DIR" ]] && ROLLBACK_ARGS="$ROLLBACK_ARGS --restore-dir '$SOURCE_DIR' --from-dest '$DEST_NAME'"
+[[ -n "$INSTALL_BINARY" ]] && ROLLBACK_ARGS="$ROLLBACK_ARGS --uninstall-binary '/usr/local/bin/$(basename "$INSTALL_BINARY")'"
+say "    ./rollback.sh $ROLLBACK_ARGS"
+say
