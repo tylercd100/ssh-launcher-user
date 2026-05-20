@@ -2,7 +2,35 @@
 
 Create a dedicated Linux user that **auto-launches a chosen command on interactive SSH login**. Useful for sandboxing AI coding agents (Claude Code, OpenAI Codex CLI, Aider, Gemini CLI, OpenCode, Goose, Cursor Agent, …) on a host while keeping their state, sudo scope, and code tree isolated from your primary account.
 
-Interactive by default; accepts CLI flags for non-interactive use.
+Single bash script. No clone required — pipe and run.
+
+## Quick start
+
+**Interactive (no install):**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/tylercd100/ssh-launcher-user/main/ssh-launcher-user)
+```
+
+`bash <(...)` uses process substitution so the script's own stdin stays attached to your terminal — interactive prompts work normally (unlike `curl | bash`, where stdin is the script itself).
+
+**Non-interactive one-liner:**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/tylercd100/ssh-launcher-user/main/ssh-launcher-user) \
+    create --username codebot --preset claude --yes
+```
+
+**Install once, reuse:**
+
+```bash
+sudo curl -fsSL -o /usr/local/bin/ssh-launcher-user \
+    https://raw.githubusercontent.com/tylercd100/ssh-launcher-user/main/ssh-launcher-user
+sudo chmod +x /usr/local/bin/ssh-launcher-user
+
+ssh-launcher-user                  # interactive create
+ssh-launcher-user rollback --help  # undo a previous run
+```
 
 ## What it does
 
@@ -13,11 +41,11 @@ For a chosen `--username`:
 3. Optionally copies your `.gitconfig` so commits keep your name/email.
 4. Optionally re-enables `PasswordAuthentication` in `sshd_config.d/*.conf` if cloud-init (or similar) had disabled it.
 5. Optionally moves an existing directory into the new user's home (`mv` + `chown -R` — instant on the same filesystem).
-6. Optionally installs a binary to `/usr/local/bin/` so the new user can run it.
+6. Optionally installs a binary to `/usr/local/bin/` so the new user can run it (handy when the binary lives in the source user's `~/.local/`).
 7. Writes a `.bash_profile` that, on **interactive SSH login**, `cd`s into the chosen directory and `exec`s your launch command. The session ends when the command exits.
 8. Optionally runs `passwd USERNAME` interactively.
 
-A companion `rollback.sh` undoes all of this in one command.
+The `rollback` subcommand undoes all of this in one command.
 
 ## Why a separate user?
 
@@ -26,62 +54,67 @@ Running an autonomous agent like `claude --dangerously-skip-permissions` over SS
 - Limited sudo scope (you choose passwordless / password / no sudo)
 - The agent's `~/.<tool>/` state and login session is isolated from your primary user
 - File ownership is unambiguous — anything the agent created is owned by the agent user
-- One-command rollback (`./rollback.sh --username NAME`) — clean teardown
-
-## Quick start
-
-```bash
-git clone <this-repo>
-cd ssh-launcher-user
-
-./ssh-launcher-user
-# Answer prompts: username, preset (claude/codex/aider/…), source dir, etc.
-# Then verify in a separate terminal:
-ssh NEW_USER@<host>
-```
+- One-command teardown — `ssh-launcher-user rollback --username NAME`
 
 ## Presets
 
-| Preset       | Default launch command                  |
-|--------------|------------------------------------------|
-| `claude`     | `claude --dangerously-skip-permissions` |
-| `codex`      | `codex`                                  |
-| `aider`      | `aider --yes-always`                     |
-| `gemini`     | `gemini`                                 |
-| `opencode`   | `opencode`                               |
-| `goose`      | `goose session`                          |
-| `cursor-agent` | `cursor-agent`                         |
-| `shell`      | *(none — plain shell on login)*          |
-| `custom`     | *(prompt for a custom command)*          |
+| Preset       | Default launch command          |
+|--------------|----------------------------------|
+| `claude`     | `claude` *(see note below)*      |
+| `codex`      | `codex`                          |
+| `aider`      | `aider --yes-always`             |
+| `gemini`     | `gemini`                         |
+| `opencode`   | `opencode`                       |
+| `goose`      | `goose session`                  |
+| `cursor-agent` | `cursor-agent`                 |
+| `shell`      | *(none — plain shell on login)*  |
+| `custom`     | *(prompt for a custom command)*  |
 
-Flag forms are exact strings — if a tool ships with different default flags than the table above, override with `--launch-cmd 'codex --my-flag'`.
+Override flags with `--launch-cmd 'codex --my-flag'`.
 
-## Non-interactive examples
+> **Note on Claude's `--dangerously-skip-permissions`**: The `claude` preset launches plain `claude` by default. In interactive mode the script asks if you want to append `--dangerously-skip-permissions` and explains the implication (auto-approves every tool use with no prompts — effectively unattended root-capable execution on a sudoer user). To opt in non-interactively, pass `--launch-cmd 'claude --dangerously-skip-permissions'`.
+
+## Examples
 
 ```bash
-# Set up 'codebot' to auto-run claude in ~/code/myapp
-./ssh-launcher-user \
+# Fully interactive
+ssh-launcher-user
+
+# Set up 'codebot' to auto-run claude in ~/code/myapp, move that dir into ~codebot/
+ssh-launcher-user create \
     --username codebot \
     --preset claude \
     --source-dir ~/code/myapp \
     --yes
 
-# A 'opsbot' user that drops into a tmux session
-./ssh-launcher-user \
+# An 'opsbot' user that drops into a tmux session, no sudo
+ssh-launcher-user create \
     --username opsbot \
     --launch-cmd 'tmux attach -t ops || tmux new -s ops' \
     --no-sudo \
     --yes
 
+# Install the claude binary system-wide while creating the user
+ssh-launcher-user create \
+    --username claudebot \
+    --preset claude \
+    --install-binary ~/.local/share/claude/versions/2.1.145 \
+    --yes
+
 # Preview without making changes
-./ssh-launcher-user --username foo --preset aider --dry-run
+ssh-launcher-user create --username foo --preset aider --dry-run
+
+# Tear it all down
+ssh-launcher-user rollback --username codebot \
+    --restore-dir ~/code/myapp --from-dest myapp \
+    --uninstall-binary /usr/local/bin/claude
 ```
 
-Run `./ssh-launcher-user --help` for the full flag list.
+Run `ssh-launcher-user --help`, `ssh-launcher-user create --help`, or `ssh-launcher-user rollback --help` for the full flag list.
 
 ## The recursive-exec trap (important)
 
-Claude Code's Bash tool sources the user's profile (`.bash_profile` on login) on every command it runs — see Anthropic's docs. A naive auto-launch like:
+Claude Code's Bash tool sources the user's profile (`.bash_profile` on login) on every command it runs. A naïve auto-launch like:
 
 ```bash
 # DON'T do this — recursive trap
@@ -104,21 +137,11 @@ fi
 
 The outer login shell sets and exports `AUTO_LAUNCHED=1`; any subshell the launched program spawns inherits it and short-circuits past the `exec`. Standard non-recursion pattern; works for any agent that has the same subshell-spawning behavior.
 
-## Rollback
-
-```bash
-./rollback.sh --username codebot \
-    --restore-dir ~/code/myapp --from-dest myapp \
-    --uninstall-binary /usr/local/bin/claude
-```
-
-Removes the user, restores the moved directory to its original location with original ownership, and removes the system-installed binary. The script prints the exact rollback command for your setup after a successful run.
-
 ## Requirements
 
 - Linux with a recent OpenSSH server
 - `sudo` available to the running user
-- Bash 4+
+- Bash 4+ (associative arrays)
 - Run as a regular sudoer — the script refuses to run as root so `$SUDO_USER` context stays clean.
 
 ## License
