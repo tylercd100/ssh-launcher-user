@@ -458,6 +458,14 @@ fi
 
 if [[ -n "\$LAUNCH_CMD" ]]; then
     cat > "\$PROFILE" <<PROFILE_EOF
+# Standard Ubuntu/Debian .profile adds ~/.local/bin to PATH, but bash
+# skips .profile when .bash_profile exists. Replicate it here so tools
+# installed under ~/.local/bin (and self-checks like claude's native
+# installer probe) work correctly.
+if [[ -d "\\\$HOME/.local/bin" && ":\\\$PATH:" != *":\\\$HOME/.local/bin:"* ]]; then
+    export PATH="\\\$HOME/.local/bin:\\\$PATH"
+fi
+
 [[ -f ~/.bashrc ]] && source ~/.bashrc
 
 # Auto-launch on interactive SSH login.
